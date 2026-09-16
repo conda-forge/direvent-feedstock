@@ -1,0 +1,86 @@
+From: Daniel Nachun <daniel.nachun@gmail.com>
+Subject: [PATCH] Fall back to nanosleep() where clock_nanosleep() is missing
+
+process_drain(), new in 5.5, calls clock_nanosleep() with TIMER_ABSTIME.
+Neither is available on macOS -- the SDK declares no clock_nanosleep() and
+libSystem exports no such symbol -- so the build fails with:
+
+    src/progman.c:267:37: error: use of undeclared identifier 'TIMER_ABSTIME'
+
+Note that -Wno-implicit-function-declaration does not paper over this,
+since TIMER_ABSTIME is a macro rather than a function.
+
+Probe for clock_nanosleep() in configure and, where it is absent, emulate
+the absolute-time sleep with nanosleep() over the remaining relative
+interval.  The interval is recomputed from ABSTIME on each call, so the
+deadline stays fixed across interruptions rather than restarting.  The
+fallback keeps the return-value semantics process_drain() relies on: 0
+once the deadline has been reached (ending the drain loop) and a non-zero
+errno value when the sleep was cut short by a signal (re-running
+process_cleanup()).  direvent installs its handlers with sa_flags = 0, so
+nanosleep() is not restarted and does report EINTR.
+
+direvent 5.4 had no process_drain() and built on osx-64 and osx-arm64;
+this is a 5.5 regression.
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -41,7 +41,7 @@
+ # Checks for typedefs, structures, and compiler characteristics.
+ 
+ # Checks for library functions.
+-AC_CHECK_FUNCS([inotify_init kqueue rfork getgrouplist])
++AC_CHECK_FUNCS([inotify_init kqueue rfork getgrouplist clock_nanosleep])
+ 
+ if test "$ac_cv_header_sys_inotify_h/$ac_cv_func_inotify_init" = yes/yes; then
+   iface=inotify
+--- a/src/progman.c
++++ b/src/progman.c
+@@ -244,6 +244,38 @@
+ 	}
+ }
+ 
++/* Sleep until ABSTIME on the CLOCK_MONOTONIC clock.  Return 0 once ABSTIME
++   has been reached, or a non-zero errno value if the sleep was interrupted
++   before that.
++
++   POSIX clock_nanosleep() does exactly this, but it is not available
++   everywhere: macOS provides neither clock_nanosleep() nor TIMER_ABSTIME.
++   There, fall back to nanosleep() over the remaining relative interval.
++   Recomputing the interval from ABSTIME on every call keeps the deadline
++   fixed across interruptions, so the caller below sees the same semantics
++   either way.  */
++static int
++sleep_until(struct timespec const *abstime)
++{
++#if defined HAVE_CLOCK_NANOSLEEP && defined TIMER_ABSTIME
++	return clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, abstime, NULL);
++#else
++	struct timespec now, rem;
++
++	if (clock_gettime(CLOCK_MONOTONIC, &now))
++		return errno;
++	rem.tv_sec = abstime->tv_sec - now.tv_sec;
++	rem.tv_nsec = abstime->tv_nsec - now.tv_nsec;
++	if (rem.tv_nsec < 0) {
++		rem.tv_nsec += 1000000000L;
++		rem.tv_sec--;
++	}
++	if (rem.tv_sec < 0)
++		return 0;
++	return nanosleep(&rem, NULL) ? errno : 0;
++#endif
++}
++
+ void
+ process_drain(void)
+ {
+@@ -264,7 +296,7 @@
+ 	do {		
+ 		process_cleanup(1);
+ 	} while (proc_list &&
+-		 clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL));
++		 sleep_until(&ts));
+ 
+ 
+ 	if (proc_list) {
