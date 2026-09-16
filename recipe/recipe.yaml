@@ -8,6 +8,8 @@ package:
 source:
   url: https://ftp.gnu.org/gnu/direvent/direvent-${{ version }}.tar.gz
   sha256: 0e16c0b4b3e6f7673e9b4f31d81ab01236ad22f83538512f3b2f58f9f96fdcb7
+  patches:
+    - 0001-Fall-back-to-nanosleep-where-clock_nanosleep-is-missing.patch
 
 build:
   number: 0
